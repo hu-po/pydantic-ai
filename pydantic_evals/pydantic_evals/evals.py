@@ -21,22 +21,36 @@ OutputT = TypeVar('OutputT')
 
 
 @contextmanager
-def evaluation(name: str) -> Iterator[Eval]:
+def evaluation(task: Callable[P, OutputT], name: str | None = None) -> Iterator[Eval[P, OutputT]]:
     """Context manager for starting an evaluation."""
     with logfire_api.span('evaluation', name=name) as eval_span:
-        yield Eval(name, eval_span)
+        yield Eval(task, name, eval_span)
 
 
 @dataclass
-class Eval:
+class Eval(Generic[P, OutputT]):
     """A container for evaluation cases.
 
     This should generally not be instantiated directly; instead, use the `evaluation` context manager.
     """
 
+    task: Callable[P, OutputT]
     name: str
-    span: logfire_api.LogfireSpan = field(repr=False)
-    cases: list[EvalCase[Any]] = field(default_factory=list)
+    span: logfire_api.LogfireSpan | None = field(repr=False)
+    cases: list[EvalCase[OutputT]] = field(repr=False, default_factory=list)
+
+    def __init__(
+        self, task: Callable[P, OutputT], name: str | None = None, span: logfire_api.LogfireSpan | None = None
+    ):
+        if name is None:
+            # TODO: Need to unwrap partials, etc., here
+            name = getattr(task, '__qualname__', None) or str(task)
+            assert isinstance(name, str)
+
+        self.task = task
+        self.name = name
+        self.span = span
+        self.cases: list[EvalCase[OutputT]] = []
 
     def as_report(self) -> EvalReport:
         return EvalReport(name=self.name, cases=[c.as_report_case() for c in self.cases])
@@ -74,7 +88,7 @@ class Eval:
     def print_diff(
         self,
         *,
-        baseline: Eval,
+        baseline: Eval[P, OutputT] | EvalReport,
         width: int | None = None,
         include_input: bool = False,
         include_output: bool = False,
@@ -88,10 +102,13 @@ class Eval:
         metric_configs: dict[str, RenderNumberConfig] | None = None,
         duration_config: RenderNumberConfig | None = None,
     ) -> None:
+        if not isinstance(baseline, EvalReport):
+            baseline = baseline.as_report()
+
         console = Console(width=width)
         console.print(
             self.as_report().console_table(
-                baseline=baseline.as_report(),
+                baseline=baseline,
                 include_input=include_input,
                 include_output=include_output,
                 include_total_duration=include_total_duration,
@@ -127,7 +144,7 @@ class Eval:
         case_id = _case_id or str(len(self.cases) + 1)
 
         with logfire_api.span(
-            Eval.case.__name__,
+            'case',
             task_name=_get_task_name(f),
             case_id=case_id,
             task_input=task_input,
@@ -155,11 +172,28 @@ class Eval:
             finally:
                 _CURRENT_EVAL_CASE.reset(token)
 
+
 @dataclass
 class Score:
     value: float
     reason: str | None = None
 
+@dataclass
+class CaseMetadata:
+    case_id: str
+    description: str | None
+    
+
+@dataclass
+class _CaseRunner(Generic[P, OutputT]):
+    eval: Eval[P, OutputT]
+    case_id: str
+    description: str | None
+
+
+    async def call(self, *args: P.args, **kwargs: P.kwargs) -> OutputT:
+        # TODO: Make this work with async functions or not
+        return await self.task(*args, **kwargs)
 
 @dataclass
 class EvalCase(Generic[OutputT]):
@@ -176,6 +210,9 @@ class EvalCase(Generic[OutputT]):
 
     case_span: logfire_api.LogfireSpan = field(repr=False)
     task_span: logfire_api.LogfireSpan = field(repr=False)
+    
+    def call(self, f: Callable[..., Awaitable[OutputT]], *case_input_args: Any, **case_input_kwargs: Any) -> Awaitable[OutputT]:
+        return f(*case_input_args, **case_input_kwargs)
 
     @property
     def case_output(self) -> OutputT:
@@ -208,7 +245,7 @@ class EvalCase(Generic[OutputT]):
 
         # We need to support updating labels via span links, but I'm not sure if we should _only_ support that
         self.case_span.set_attribute(label_attribute, value)
-        
+
     def record_metadata(self, name: str, value: bool | str) -> None:
         label_attribute = f'label.{name}'
         self.metadata[name] = value

@@ -14,11 +14,10 @@ async def main():
         increment_eval_metric('tokens', len(deps) * x)
         return 2 * x
 
-    with evaluation('my_baseline_eval') as baseline_eval:
-        task = partial(function_i_want_to_evaluate, deps='some (non-serializable) dependencies')
-
+    task = partial(function_i_want_to_evaluate, deps='some (non-serializable) dependencies')
+    with evaluation(task, 'my_baseline_eval') as baseline_eval:
         for x in [1, 2, 3]:
-            async with baseline_eval.case(task, _case_id=f'{x=}', x=x) as eval_case:
+            async with baseline_eval.case(f'{x=}').call(x=x) as eval_case:
                 output = eval_case.case_output
                 eval_case.increment_metric('other_metric', 10)
                 eval_case.record_score('my_score_1', output / 2)
