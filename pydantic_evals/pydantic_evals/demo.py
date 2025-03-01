@@ -1,47 +1,104 @@
-# TODO: Need to convert this into tests and documentation
-from pydantic_evals.evals import evaluation, increment_eval_metric
+from functools import partial
+
+from pydantic import AwareDatetime, BaseModel
+from typing_extensions import TypedDict
+
+from pydantic_evals import evaluation
+from pydantic_evals.demo_agent import (
+    TimeRangeAgentResponse,
+    infer_time_range,
+)
+from pydantic_evals.evals import EvalCase
+from pydantic_evals.llm_as_a_judge import GradingOutput, judge_input_output
+
+
+class TimeRangeInputs(TypedDict):
+    """The inputs for a time range inference agent."""
+
+    prompt: str
+    now: AwareDatetime
+
+
+class TimeRangeExample(BaseModel):
+    """An example of a time range inference agent input and output."""
+
+    name: str
+    inputs: TimeRangeInputs
+    expected_output: TimeRangeAgentResponse
+
+
+raw_cases = [
+    {
+        'name': 'yesterday',
+        'inputs': {'prompt': 'yesterday from 2-4 ET', 'now': '2024-01-01T00:00:00Z'},
+        'expected_output': {
+            'min_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'max_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'explanation': '...',
+        },
+    },
+    {
+        'name': 'last 24 hours',
+        'inputs': {'prompt': 'the last 24 hours', 'now': '2024-01-01T00:00:00Z'},
+        'expected_output': {
+            'min_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'max_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'explanation': '...',
+        },
+    },
+    {
+        'name': 'specific time range',
+        'inputs': {'prompt': '6 to 9 PM ET on October 8th', 'now': '2024-01-01T00:00:00Z'},
+        'expected_output': {
+            'min_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'max_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'explanation': '...',
+        },
+    },
+    {
+        'name': 'next week',
+        'inputs': {'prompt': 'next week', 'now': '2024-01-01T00:00:00Z'},
+        'expected_output': {
+            'min_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'max_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'explanation': '...',
+        },
+    },
+    {
+        'name': 'invalid - question',
+        'inputs': {'prompt': 'what time is it?', 'now': '2024-01-01T00:00:00Z'},
+        'expected_output': {
+            'min_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'max_timestamp_with_offset': '2024-01-01T00:00:00Z',
+            'explanation': '...',
+        },
+    },
+]
+cases = [TimeRangeExample.model_validate(raw_case) for raw_case in raw_cases]
+
+
+async def judge_time_range_case(inputs: TimeRangeInputs, output: TimeRangeAgentResponse) -> GradingOutput:
+    """Judge the output of a time range inference agent based on a rubric."""
+    rubric = 'The output should be a reasonable time range to select for the given inputs.'
+    return await judge_input_output(inputs, output, rubric)
 
 
 async def main():
     """TODO: Remove this file before merging."""
-    from functools import partial
-
     import logfire
 
     logfire.configure(send_to_logfire=False, console=logfire.ConsoleOptions(verbose=True))
 
-    async def function_i_want_to_evaluate(x: int, deps: str) -> int:
-        increment_eval_metric('tokens', len(deps) * x)
-        return 2 * x
+    async def handle_case(eval_case: EvalCase[..., TimeRangeAgentResponse], inputs: TimeRangeInputs):
+        result = await judge_time_range_case(inputs=inputs, output=eval_case.output)
+        eval_case.record_label('reasonable', 'yes' if result else 'no')
 
-    task = partial(function_i_want_to_evaluate, deps='some (non-serializable) dependencies')
-    with evaluation(task, 'my_baseline_eval') as baseline_eval:
-        for x in [1, 2, 3]:
-            async with baseline_eval.case(f'{x=}').call(task, x=x) as eval_case:
-                output = eval_case.output
-                eval_case.increment_metric('other_metric', 10)
-                eval_case.record_score('my_score_1', output / 2)
-                eval_case.record_score('my_score_2', output / 10)
-                eval_case.record_score('old_score', output / 10)
-                eval_case.record_label('sentiment', 'positive' if x == 1 else 'negative')
-                eval_case.record_label('old_label', 'hello')
+    async with evaluation(infer_time_range) as my_eval:
+        for case_data in cases:
+            bound_handler = partial(handle_case, inputs=case_data.inputs)
+            my_eval.case(name=case_data.name).call(**case_data.inputs).parallel_handler(bound_handler)
 
-    task = partial(function_i_want_to_evaluate, deps='some other (non-serializable) dependencies')
-    with evaluation(task, 'my_new_eval') as new_eval:
-        for x in [1, 2, 4]:
-            async with new_eval.case('abc').call(task, x=x) as eval_case:
-                output = eval_case.output
-                eval_case.increment_metric('other_metric', 15)
-                eval_case.increment_metric('new_metric', 15)
-                eval_case.record_score('my_score_1', output / 3)
-                eval_case.record_score('my_score_2', output / 6)
-                eval_case.record_score('new_score', output + 1)
-                eval_case.record_label('sentiment', 'positive')
-                eval_case.record_label('new_label', 'world')
-
-    baseline_eval.print_report(include_input=True, include_output=True)
-    new_eval.print_report(include_input=True, include_output=True)
-    new_eval.print_diff(baseline=baseline_eval, include_input=True, include_output=True, include_removed_cases=True)
+    my_eval.print_report(include_input=True, include_output=True)
 
 
 if __name__ == '__main__':

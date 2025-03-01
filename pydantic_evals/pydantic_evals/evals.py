@@ -1,11 +1,12 @@
 from __future__ import annotations as _annotations
 
+import asyncio
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import AsyncIterator, Awaitable
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import cached_property, partial
+from functools import partial
 from typing import Any, Callable, Generic, ParamSpec, TypeVar
 
 import logfire_api
@@ -20,39 +21,55 @@ P = ParamSpec('P')
 OutputT = TypeVar('OutputT')
 
 
-# TODO: signature should be Callable[P, Awaitable[OutputT]] -> Iterator[Eval[P, OutputT]]
-@contextmanager
-def evaluation(task: Callable[..., Any], name: str | None = None) -> Iterator[Eval]:
+@asynccontextmanager
+async def evaluation(
+    task: Callable[P, Awaitable[OutputT]], *, name: str | None = None
+) -> AsyncIterator[Eval[P, OutputT]]:
     """Context manager for starting an evaluation."""
     with logfire_api.span('evaluation', name=name) as eval_span:
-        yield Eval(task, name, eval_span)
+        eval = Eval(task, name=name, span=eval_span)
+
+        yield eval
+
+        async def _handle_case(case: EvalCase[P, OutputT]) -> None:
+            if not case.has_output:
+                async with case:
+                    pass
+
+        async with asyncio.TaskGroup() as group:
+            for eval_case in eval.cases:
+                # TODO: Use a semaphore to enforce some kind of max concurrency.
+                #  See https://discuss.python.org/t/adding-a-limit-parameter-to-taskgroup-for-concurrent-coroutines-management/47686/3
+                group.create_task(_handle_case(eval_case), name=eval_case.name)
 
 
-# TODO: Make Eval generic once https://github.com/microsoft/pyright/issues/10011 is resolved
 @dataclass
-class Eval:  # TODO: (Generic[P, OutputT]):
+class Eval(Generic[P, OutputT]):
     """A container for evaluation cases.
 
     This should generally not be instantiated directly; instead, use the `evaluation` context manager.
     """
 
-    task: Callable[..., Awaitable[Any]]  # TODO: Should be Callable[P, Awaitable[OutputT]]
+    task: Callable[P, Awaitable[OutputT]]
     task_name: str
+    handler: Callable[[EvalCase[P, OutputT]], Awaitable[None]]
     span: logfire_api.LogfireSpan | None = field(repr=False)
-    cases: list[EvalCase[Any]] = field(repr=False, default_factory=list)  # TODO: Should be list[EvalCase[OutputT]]
+    cases: list[EvalCase[..., Any]] = field(repr=False, default_factory=list)  # TODO: Should be list[EvalCase[OutputT]]
 
-    def __init__(self, task: Callable[..., Any], name: str | None = None, span: logfire_api.LogfireSpan | None = None):
+    def __init__(
+        self,
+        task: Callable[P, Awaitable[OutputT]],
+        *,
+        name: str | None = None,
+        span: logfire_api.LogfireSpan | None = None,
+    ):
         if name is None:
             name = _get_task_name(task)
         self.task = task
 
         self.name = name
         self.span = span
-        self.cases: list[EvalCase[Any]] = []
-
-    @cached_property
-    def task_signature(self) -> inspect.Signature:
-        return inspect.signature(self.task)
+        self.cases: list[EvalCase[..., Any]] = []
 
     def as_report(self) -> EvalReport:
         return EvalReport(name=self.name, cases=[c.as_report_case() for c in self.cases])
@@ -90,7 +107,7 @@ class Eval:  # TODO: (Generic[P, OutputT]):
     def print_diff(
         self,
         *,
-        baseline: Eval | EvalReport,
+        baseline: Eval[P, OutputT] | EvalReport,
         width: int | None = None,
         include_input: bool = False,
         include_output: bool = False,
@@ -125,86 +142,91 @@ class Eval:  # TODO: (Generic[P, OutputT]):
             )
         )
 
-    def case(self, name: str) -> _CaseRunner:
-        return _CaseRunner(self, name)
+    def case(self, name: str) -> EvalCase[P, OutputT]:
+        case = EvalCase(name, self)
+        self.cases.append(case)
+        return case
 
 
-@dataclass
-class _CaseRunner:  # TODO: This should be generic in the same params as Eval
-    eval: Eval
-    name: str
-
-    @asynccontextmanager
-    async def call(
-        self,
-        task: Callable[P, Awaitable[OutputT]],
-        /,
-        *case_input_args: P.args,
-        **case_input_kwargs: P.kwargs,
-    ) -> AsyncIterator[EvalCase[OutputT]]:
-        if _CURRENT_EVAL_CASE.get() is not None:
-            raise RuntimeError('An eval case has already been entered. Evaluation cases should not be nested')
-        assert self.eval.task is task  # TODO: Remove this once Eval is made generic
-
-        task = self.eval.task
-        eval = self.eval
-        name = self.name
-
-        bound_arguments = eval.task_signature.bind(*case_input_args, **case_input_kwargs)
-
-        inputs = dict(bound_arguments.arguments)
-        bound_arguments.apply_defaults()
-        task_defaults = {k: v for k, v in bound_arguments.arguments.items() if k not in inputs}
-
-        with logfire_api.span(
-            'case: {name}',
-            name=name,
-            task_input=inputs,
-            task_defaults=task_defaults,
-        ) as case_span:
-            task_span = logfire_api.span('task execution')
-            eval_case = EvalCase[OutputT](name, inputs=inputs, case_span=case_span, task_span=task_span)
-            token = _CURRENT_EVAL_CASE.set(eval_case)
-
-            try:
-                with task_span:
-                    # Note: Ideally we'd have a way to make sure that we didn't open an extra nested span here if f
-                    # was already opening a span of its own
-                    # It's important to have a span that exists only around the call of `f` though, otherwise
-                    # if you do some slow/heavy-weight scoring after this function yields, you won't be able to
-                    # distinguish between that time and the time spent in the function call itself
-                    eval_case.task_span = task_span
-                    case_output = await eval.task(*bound_arguments.args, **bound_arguments.kwargs)
-
-                case_span.set_attribute('case_output', case_output)
-                eval_case.output = case_output
-                eval.cases.append(eval_case)
-
-                yield eval_case
-            finally:
-                _CURRENT_EVAL_CASE.reset(token)
-
-
-@dataclass
-class EvalCase(Generic[OutputT]):
+@dataclass(init=False)
+class EvalCase(Generic[P, OutputT]):
     """A container for an evaluation case."""
 
     name: str
-    inputs: dict[str, Any]
-    _output: OutputT | Unset = field(init=False, default=UNSET)
+    eval: Eval[P, OutputT]
 
-    scores: dict[str, int | float] = field(init=False, default_factory=dict)
-    metrics: dict[str, int | float] = field(init=False, default_factory=dict)
-    labels: dict[str, bool | str] = field(init=False, default_factory=dict)
-    metadata: dict[str, Any] = field(init=False, default_factory=dict)
+    scores: dict[str, int | float]
+    metrics: dict[str, int | float]
+    labels: dict[str, bool | str]
+    metadata: dict[str, Any]
 
-    case_span: logfire_api.LogfireSpan = field(repr=False)
-    task_span: logfire_api.LogfireSpan = field(repr=False)
+    def __init__(self, name: str, eval: Eval[P, OutputT]):
+        self.name = name
+        self.eval = eval
 
-    def call(
-        self, f: Callable[..., Awaitable[OutputT]], *case_input_args: Any, **case_input_kwargs: Any
-    ) -> Awaitable[OutputT]:
-        return f(*case_input_args, **case_input_kwargs)
+        self.scores = {}
+        self.metrics = {}
+        self.labels = {}
+        self.metadata = {}
+
+        self._inputs: dict[str, Any] | None = None
+        self._default_inputs: dict[str, Any] | None = None
+        self._bound_arguments: inspect.BoundArguments | None = None
+        self._output: OutputT | Unset = UNSET
+
+        self._case_span: logfire_api.LogfireSpan | None = None
+        self._task_span: logfire_api.LogfireSpan | None = None
+        self._parallel_handler: Callable[[EvalCase[P, OutputT]], Awaitable[None]] | None = None
+        self._token: Any = None
+
+    @property
+    def inputs(self) -> dict[str, Any]:
+        if self._inputs is None:
+            raise RuntimeError('You must call `EvalCase.call` before accessing the inputs.')
+        return self._inputs
+
+    @property
+    def bound_arguments(self) -> inspect.BoundArguments:
+        if self._bound_arguments is None:
+            raise RuntimeError('You must call `EvalCase.call` before accessing the bound_arguments.')
+        return self._bound_arguments
+
+    @property
+    def case_span(self) -> logfire_api.LogfireSpan:
+        if self._case_span is None:
+            raise RuntimeError('You must use `with` before accessing the case_span.')
+        return self._case_span
+
+    @property
+    def task_span(self) -> logfire_api.LogfireSpan:
+        if self._task_span is None:
+            raise RuntimeError('You must use `with` before accessing the task_span.')
+        return self._task_span
+
+    def call(self, *case_input_args: P.args, **case_input_kwargs: P.kwargs) -> EvalCase[P, OutputT]:
+        signature = inspect.signature(self.eval.task)
+        bound_arguments = signature.bind(*case_input_args, **case_input_kwargs)
+        self._inputs = dict(bound_arguments.arguments)
+        bound_arguments.apply_defaults()
+        self._default_inputs = {k: v for k, v in bound_arguments.arguments.items() if k not in self._inputs}
+        self._bound_arguments = bound_arguments
+
+        self._case_span = logfire_api.span(
+            'case: {name}',
+            name=self.name,
+            task_input=self._inputs,
+            task_defaults=self._default_inputs,
+        )
+        self._task_span = logfire_api.span('task execution')
+        return self
+
+    def parallel_handler(self, handler: Callable[[EvalCase[P, OutputT]], Awaitable[None]]) -> EvalCase[P, OutputT]:
+        self._parallel_handler = handler
+        return self
+
+    @property
+    def has_output(self) -> bool:
+        return not isinstance(self._output, Unset)
 
     @property
     def output(self) -> OutputT:
@@ -277,8 +299,27 @@ class EvalCase(Generic[OutputT]):
             total_duration=_get_span_duration(self.case_span),
         )
 
+    async def __aenter__(self):
+        if _CURRENT_EVAL_CASE.get() is not None:
+            raise RuntimeError('An eval case has already been entered. Evaluation cases should not be nested')
+        self._token = _CURRENT_EVAL_CASE.set(self)
+        self.case_span.__enter__()
+        with self.task_span:
+            case_output = await self.eval.task(*self.bound_arguments.args, **self.bound_arguments.kwargs)
+        self.case_span.set_attribute('case_output', case_output)
+        self.output = case_output
+        return self
 
-_CURRENT_EVAL_CASE = ContextVar[EvalCase[Any] | None]('_CURRENT_EVAL_CASE', default=None)
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: Any
+    ) -> None:
+        if self._parallel_handler is not None:
+            await self._parallel_handler(self)
+        self.case_span.__exit__(exc_type, exc_value, traceback)
+        _CURRENT_EVAL_CASE.reset(self._token)
+
+
+_CURRENT_EVAL_CASE = ContextVar[EvalCase[..., Any] | None]('_CURRENT_EVAL_CASE', default=None)
 
 
 def increment_eval_metric(name: str, amount: int | float) -> None:
