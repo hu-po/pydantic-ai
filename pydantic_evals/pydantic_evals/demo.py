@@ -17,8 +17,8 @@ async def main():
     task = partial(function_i_want_to_evaluate, deps='some (non-serializable) dependencies')
     with evaluation(task, 'my_baseline_eval') as baseline_eval:
         for x in [1, 2, 3]:
-            async with baseline_eval.case(f'{x=}').call(x=x) as eval_case:
-                output = eval_case.case_output
+            async with baseline_eval.case(f'{x=}').call(task, x=x) as eval_case:
+                output = eval_case.output
                 eval_case.increment_metric('other_metric', 10)
                 eval_case.record_score('my_score_1', output / 2)
                 eval_case.record_score('my_score_2', output / 10)
@@ -26,12 +26,11 @@ async def main():
                 eval_case.record_label('sentiment', 'positive' if x == 1 else 'negative')
                 eval_case.record_label('old_label', 'hello')
 
-    with evaluation('my_new_eval') as new_eval:
-        task = partial(function_i_want_to_evaluate, deps='some other (non-serializable) dependencies')
-
+    task = partial(function_i_want_to_evaluate, deps='some other (non-serializable) dependencies')
+    with evaluation(task, 'my_new_eval') as new_eval:
         for x in [1, 2, 4]:
-            async with new_eval.case(task, _case_id=f'{x=}', x=x) as eval_case:
-                output = eval_case.case_output
+            async with new_eval.case('abc').call(task, x=x) as eval_case:
+                output = eval_case.output
                 eval_case.increment_metric('other_metric', 15)
                 eval_case.increment_metric('new_metric', 15)
                 eval_case.record_score('my_score_1', output / 3)

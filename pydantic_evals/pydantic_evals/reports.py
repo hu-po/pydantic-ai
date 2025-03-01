@@ -320,9 +320,9 @@ class EvalReportCaseAggregate(BaseModel):
 class EvalReportCase(BaseModel):
     """A single case in an evaluation report."""
 
-    case_id: str
-    case_input: dict[str, Any]
-    case_output: Any
+    name: str
+    inputs: dict[str, Any]
+    output: Any
 
     scores: dict[str, float | int]
     metrics: dict[str, float | int]
@@ -413,13 +413,13 @@ class EvalCaseRenderer:
 
     def build_row(self, case: EvalReportCase) -> list[str]:
         """Build a table row for a single case."""
-        row = [case.case_id]
+        row = [case.name]
 
         if self.include_input:
-            row.append(self.input_renderer.render_value(None, case.case_input) or EMPTY_CELL_STR)
+            row.append(self.input_renderer.render_value(None, case.inputs) or EMPTY_CELL_STR)
 
         if self.include_output:
-            row.append(self.output_renderer.render_value(None, case.case_output) or EMPTY_CELL_STR)
+            row.append(self.output_renderer.render_value(None, case.output) or EMPTY_CELL_STR)
 
         if self.include_scores:
             row.append(self._render_dict(case.scores, self.score_renderers))
@@ -462,19 +462,15 @@ class EvalCaseRenderer:
         baseline: EvalReportCase,
     ) -> list[str]:
         """Build a table row for a given case ID."""
-        assert baseline.case_id == new_case.case_id, 'This should only be called for matching case IDs'
-        row = [baseline.case_id]
+        assert baseline.name == new_case.name, 'This should only be called for matching case IDs'
+        row = [baseline.name]
 
         if self.include_input:
-            input_diff = (
-                self.input_renderer.render_diff(None, baseline.case_input, new_case.case_input) or EMPTY_CELL_STR
-            )
+            input_diff = self.input_renderer.render_diff(None, baseline.inputs, new_case.inputs) or EMPTY_CELL_STR
             row.append(input_diff)
 
         if self.include_output:
-            output_diff = (
-                self.output_renderer.render_diff(None, baseline.case_output, new_case.case_output) or EMPTY_CELL_STR
-            )
+            output_diff = self.output_renderer.render_diff(None, baseline.output, new_case.output) or EMPTY_CELL_STR
             row.append(output_diff)
 
         if self.include_scores:
@@ -623,8 +619,8 @@ class EvalRenderer:
     def _baseline_cases_to_include(self, report: EvalReport, baseline: EvalReport) -> list[EvalReportCase]:
         if self.include_removed_cases:
             return baseline.cases
-        report_case_ids = {case.case_id for case in report.cases}
-        return [case for case in baseline.cases if case.case_id in report_case_ids]
+        report_case_names = {case.name for case in report.cases}
+        return [case for case in baseline.cases if case.name in report_case_names]
 
     def _get_case_renderer(self, report: EvalReport, baseline: EvalReport | None = None) -> EvalCaseRenderer:
         input_renderer = _ValueRenderer.from_config(self.input_config)
@@ -666,8 +662,8 @@ class EvalRenderer:
         report_cases = report.cases
         baseline_cases = self._baseline_cases_to_include(report, baseline)
 
-        report_cases_by_id = {case.case_id: case for case in report_cases}
-        baseline_cases_by_id = {case.case_id: case for case in baseline_cases}
+        report_cases_by_id = {case.name: case for case in report_cases}
+        baseline_cases_by_id = {case.name: case for case in baseline_cases}
 
         diff_cases: list[tuple[EvalReportCase, EvalReportCase]] = []
         removed_cases: list[EvalReportCase] = []
@@ -686,7 +682,8 @@ class EvalRenderer:
                 assert False, 'This should be unreachable'
 
         case_renderer = self._get_case_renderer(report, baseline)
-        table = case_renderer.build_base_table(f'Evaluation Diff: {baseline.name} → {report.name}')
+        diff_name = baseline.name if baseline.name == report.name else f'{baseline.name} → {report.name}'
+        table = case_renderer.build_base_table(f'Evaluation Diff: {diff_name}')
         for baseline_case, new_case in diff_cases:
             table.add_row(*case_renderer.build_diff_row(new_case, baseline_case))
         for case in added_cases:
