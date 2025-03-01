@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=./test_cases_schema.json
+test_cases:
+- name: Specific Date Mention
+  inputs:
+    prompt: Let's meet on March 25, 2024.
+    now: '2023-10-05T14:30:00Z'
+  expected_output:
+    min_timestamp_with_offset: '2024-03-25T00:00:00Z'
+    max_timestamp_with_offset: '2024-03-25T23:59:59Z'
+    explanation: The user mentioned a specific date, so a full day range was selected.
+  metadata: {}
+- name: Ambiguous Month
+  inputs:
+    prompt: We should plan a meeting sometime in April.
+    now: '2023-10-05T14:30:00Z'
+  expected_output:
+    error_message: The prompt is too ambiguous to determine a specific time range
+      without additional context.
+  metadata: {}
+- name: Tomorrow at Noon
+  inputs:
+    prompt: Let's have lunch tomorrow at noon.
+    now: '2023-10-05T14:30:00Z'
+  expected_output:
+    min_timestamp_with_offset: '2023-10-06T12:00:00Z'
+    max_timestamp_with_offset: '2023-10-06T12:59:59Z'
+    explanation: A one-hour window was selected around noon of the day following the
+      specified current date.
+  metadata: {}
